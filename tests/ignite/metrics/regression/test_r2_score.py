@@ -65,6 +65,59 @@ def test_r2_score_2(available_device):
     assert m.compute() == pytest.approx(expected)
 
 
+def test_r2_score_numerical_stability_under_large_mean():
+    """Regression for the Welford-based denominator.
+
+    Constructs a float32 ``y`` with large mean (1e6) and small relative
+    variance. The naive ``Σ y² − (Σ y)² / n`` denominator catastrophically
+    cancels at this scale and the resulting R² is way off; the Welford
+    denominator preserves the relevant low-order bits and the metric
+    stays within sklearn's float64 reference.
+    """
+    torch.manual_seed(0)
+    n = 1024
+    base = torch.full((n,), 1e6, dtype=torch.float32)
+    y_f32 = base + torch.randn(n, dtype=torch.float32)
+    y_pred_f32 = y_f32 + 0.1 * torch.randn(n, dtype=torch.float32)
+
+    # sklearn reference in float64 land.
+    expected = r2_score(y_f32.to(torch.float64).numpy(), y_pred_f32.to(torch.float64).numpy())
+
+    m = R2Score()
+    m.update((y_pred_f32, y_f32))
+    got = m.compute()
+
+    assert got == pytest.approx(expected, rel=1e-6, abs=1e-6)
+
+    # Sanity check: the naive float32 formula would not get this close.
+    # If a future change re-introduced it, this assertion would still
+    # protect the contract because we compare against the float64 ref.
+    naive_denom = (y_f32 * y_f32).sum() - (y_f32.sum() ** 2) / n
+    naive_num = ((y_pred_f32 - y_f32) ** 2).sum()
+    naive_r2 = (1 - naive_num / naive_denom).item()
+    # On float32 with mean 1e6 the naive denominator collapses to noise
+    # and the resulting R² drifts well outside the 1e-6 band the
+    # Welford path holds.
+    assert abs(naive_r2 - expected) > 1e-3, (
+        "Test setup must produce a regime where the naive formula fails; "
+        "if this assertion fails, pick a larger mean or smaller variance."
+    )
+
+
+def test_r2_score_zero_variance_y_raises():
+    """R² is undefined when ``y`` has zero variance. The original code
+    silently returned ``-inf`` or ``nan`` in this case; the Welford
+    port raises ``NotComputableError`` so a caller cannot accidentally
+    feed garbage into a downstream pipeline.
+    """
+    m = R2Score()
+    y = torch.full((16,), 3.0)
+    y_pred = torch.randn(16)
+    m.update((y_pred, y))
+    with pytest.raises(NotComputableError, match=r"zero variance"):
+        m.compute()
+
+
 def test_integration_r2_score(available_device):
     torch.manual_seed(1)
     size = 105
